@@ -298,35 +298,54 @@ u16 dest_port;
 
 if (!adapter->throttle_enabled)
 return false;
-if (length < ETH_HLEN + sizeof(struct iphdr) + sizeof(struct tcphdr))
+/* Only large data packets - skip control packets */
+if (length < 1400)
 return false;
-eth = (struct ethhdr *)data;
-if (ntohs(eth->h_proto) != ETH_P_IP)
+/* Never drop connection setup or teardown */
+{
+struct ethhdr *eth2 = (struct ethhdr *)data;
+if (ntohs(eth2->h_proto) == ETH_P_IP) {
+struct iphdr *iph2 = (struct iphdr *)(data + ETH_HLEN);
+if (iph2->protocol == IPPROTO_TCP) {
+struct tcphdr *tcph2 = (struct tcphdr *)(data + ETH_HLEN + (iph2->ihl * 4));
+if (tcph2->syn || tcph2->fin || tcph2->rst)
 return false;
-iph = (struct iphdr *)(data + ETH_HLEN);
-if (iph->protocol != IPPROTO_TCP)
-return false;
-tcph = (struct tcphdr *)(data + ETH_HLEN + (iph->ihl * 4));
-dest_port = ntohs(tcph->dest);
-if (adapter->throttle_port != 0 && dest_port != adapter->throttle_port)
-return false;
-if (length < 1000)
-return false;
-if (!tcph->psh)
-return false;
+}
+}
+}
 return true;
 }
 
 static bool e1000_throttle_packet(struct e1000_adapter *adapter,
   u8 *data, unsigned int length)
 {
-ktime_t now;
-s64 elapsed_us;
 u32 random_val;
-
 if (!e1000_is_video_packet(adapter, data, length))
 return false;
 adapter->throttled_packets++;
+/* -- BURST MODE: drop for burst_drop_ms, pass for burst_pause_ms -- */
+if (adapter->burst_mode && adapter->burst_drop_ms > 0
+    && adapter->burst_pause_ms > 0) {
+unsigned long cycle_len_jiffies;
+unsigned long drop_len_jiffies;
+unsigned long elapsed;
+unsigned long pos_in_cycle;
+cycle_len_jiffies = msecs_to_jiffies(adapter->burst_drop_ms + adapter->burst_pause_ms);
+drop_len_jiffies = msecs_to_jiffies(adapter->burst_drop_ms);
+if (adapter->burst_cycle_start == 0)
+adapter->burst_cycle_start = jiffies;
+elapsed = jiffies - adapter->burst_cycle_start;
+pos_in_cycle = elapsed % cycle_len_jiffies;
+if (pos_in_cycle < drop_len_jiffies) {
+adapter->dropped_packets++;
+adapter->burst_drop_count++;
+return true;
+} else {
+adapter->burst_pass_count++;
+return false;
+}
+}
+/* -- RANDOM DROP MODE (original behavior) -- */
 if (adapter->throttle_drop_percent > 0) {
 get_random_bytes(&random_val, sizeof(random_val));
 random_val = random_val % 100;
@@ -334,13 +353,6 @@ if (random_val < adapter->throttle_drop_percent) {
 adapter->dropped_packets++;
 return true;
 }
-}
-if (adapter->throttle_delay_us > 0) {
-now = ktime_get();
-elapsed_us = ktime_us_delta(now, adapter->last_throttle_time);
-if (elapsed_us < adapter->throttle_delay_us)
-udelay(adapter->throttle_delay_us - elapsed_us);
-adapter->last_throttle_time = ktime_get();
 }
 return false;
 }
@@ -354,6 +366,14 @@ seq_printf(m, "Delay:     %u us\n", adapter->throttle_delay_us);
 seq_printf(m, "Drop%%:     %u%%\n", adapter->throttle_drop_percent);
 seq_printf(m, "Throttled: %llu\n", adapter->throttled_packets);
 seq_printf(m, "Dropped:   %llu\n", adapter->dropped_packets);
+seq_printf(m, "Mode:      %s\n", adapter->burst_mode ? "BURST" : "RANDOM");
+if (adapter->burst_mode) {
+seq_printf(m, "Burst:     drop %ums, pass %ums (cycle %ums)\n",
+  adapter->burst_drop_ms, adapter->burst_pause_ms,
+  adapter->burst_drop_ms + adapter->burst_pause_ms);
+seq_printf(m, "BurstDrop: %llu\n", adapter->burst_drop_count);
+seq_printf(m, "BurstPass: %llu\n", adapter->burst_pass_count);
+}
 return 0;
 }
 
@@ -368,8 +388,10 @@ static ssize_t e1000_throttler_write(struct file *file,
 {
 struct seq_file *m = file->private_data;
 struct e1000_adapter *adapter = m->private;
+pr_info("[SAM][TASK2] throttler_write: adapter=%px m->private=%px\n", adapter, m->private);
 char buf[128];
 unsigned int value;
+unsigned int value2 = 0;
 
 if (count >= sizeof(buf))
 return -EINVAL;
@@ -387,6 +409,19 @@ else if (sscanf(buf, "delay %u", &value) == 1)
 adapter->throttle_delay_us = value;
 else if (sscanf(buf, "drop %u", &value) == 1)
 adapter->throttle_drop_percent = (value > 100) ? 100 : value;
+else if (sscanf(buf, "burst %u %u", &value, &value2) == 2) {
+adapter->burst_mode = true;
+adapter->burst_drop_ms = value;
+adapter->burst_pause_ms = value2;
+adapter->burst_cycle_start = jiffies;
+adapter->burst_drop_count = 0;
+adapter->burst_pass_count = 0;
+pr_info("[SAM] Burst mode: drop %ums, pass %ums\n", value, value2);
+}
+else if (strncmp(buf, "noburst", 7) == 0) {
+adapter->burst_mode = false;
+pr_info("[SAM] Burst mode disabled, back to random drop\n");
+}
 else if (strncmp(buf, "reset", 5) == 0) {
 adapter->throttle_enabled = false;
 adapter->throttle_delay_us = 0;
@@ -394,6 +429,12 @@ adapter->throttle_drop_percent = 0;
 adapter->throttle_port = 443;
 adapter->throttled_packets = 0;
 adapter->dropped_packets = 0;
+adapter->burst_mode = false;
+adapter->burst_drop_ms = 0;
+adapter->burst_pause_ms = 0;
+adapter->burst_cycle_start = 0;
+adapter->burst_drop_count = 0;
+adapter->burst_pass_count = 0;
 }
 return count;
 }
@@ -422,8 +463,13 @@ snprintf(proc_name, sizeof(proc_name), "e1000_throttler_%s",
 adapter->throttler_proc = proc_create_data(proc_name, 0644, NULL,
    &e1000_throttler_fops,
    adapter);
-if (adapter->throttler_proc)
-netdev_info(adapter->netdev, "[SAM] throttler: /proc/%s\n", proc_name);
+netdev_info(adapter->netdev, "[SAM] throttler: attempting /proc/%s\n", proc_name);
+if (adapter->throttler_proc) {
+	netdev_info(adapter->netdev, "[SAM] throttler: /proc/%s created OK\n", proc_name);
+	netdev_info(adapter->netdev, "[SAM][TASK2] proc created: adapter=%px\n", adapter);
+}
+else
+	netdev_err(adapter->netdev, "[SAM] throttler: proc_create_data FAILED for %s\n", proc_name);
 }
 
 static void e1000_remove_throttler_proc(struct e1000_adapter *adapter)
@@ -4570,7 +4616,6 @@ static bool e1000_clean_rx_irq(struct e1000_adapter *adapter,
 		prefetch(data);
 		/* === VIDEO THROTTLER POC === */
 		if (e1000_throttle_packet(adapter, data, length)) {
-			pr_info_ratelimited("[SAM][THROTTLE] dropped len=%u\n", length);
 			goto next_desc;
 		}
 		/* === END THROTTLER POC === */
